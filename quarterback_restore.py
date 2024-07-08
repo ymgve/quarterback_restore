@@ -132,6 +132,8 @@ class Decompressor:
                 raise Exception("code 257 not handled yet!")
                 
             if code not in codes:
+                if code != self.next_code:
+                    print("WARNING: Unexpected code", self.next_code, code)
                 codes[code] = curr_entry + curr_entry[0:1]
                 
             res += codes[code]
@@ -189,7 +191,7 @@ def decrypt_disk(diskdata, key):
         
     trans = bytes(temptable)
     
-    return diskdata[:0x18] + diskdata[0x18:].translate(trans)
+    return diskdata[:0x10] + diskdata[0x10:].translate(trans)
 
 
 def find_candidate_key(diskdata):
@@ -275,6 +277,7 @@ def main():
             files.append(currfilename)
             currfilename = make_next(currfilename)
             
+    firstheader = None
     archivedata = bytearray()
     for currfilename in files:
         diskdata = open(currfilename, "rb").read()
@@ -283,6 +286,9 @@ def main():
         t_days, t_mins = struct.unpack(">II", diskdata[6:14])
         print("Adding disk image file", currfilename, "header", diskdata[0:4], "disk number", diskdata[4], "backup date", make_date(t_days, t_mins, 0))
         
+        if firstheader is None:
+            firstheader = diskdata[:0x18]
+            
         decrypted = decrypt_disk(diskdata, key)
         
         if args.saveplain:
@@ -297,8 +303,14 @@ def main():
         
     if args.catalog:
         bio = io.BytesIO(archivedata)
+
+        # Encryption starts at 0x18 for the first disk of an archive, 0x10 on the others
+        # To simplify and because we can't reliably detect the first disk, we always
+        # start decryption at 0x10. If we're looking for a catalog, we assume we got the first
+        # disk and can get the undecrypted data from the firstheader variable
+        buffersize, catsize = struct.unpack(">II", firstheader[0x10:0x18])
         
-        buffersize, catsize, version, _, numvols, compress, password, comment, name, volname = struct.unpack(">IIBBHB11s100s40s40s", bio.read(0xcc))
+        _, _, version, _, numvols, compress, password, comment, name, volname = struct.unpack(">IIBBHB11s100s40s40s", bio.read(0xcc))
         password = clean_cstring(password)
         comment = clean_cstring(comment)
         name = clean_cstring(name)
