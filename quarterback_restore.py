@@ -9,7 +9,7 @@ def make_day_translation():
                 dpm = 29
                     
             for d in range(dpm):
-                dates.append((y, m, d))
+                dates.append((y, m + 1, d + 1))
                 
     return dates
         
@@ -31,7 +31,7 @@ def make_next(s):
     numbers = re.findall(r'\d+', s)
     
     if not numbers:
-        raise Exception()
+        return None
     
     last_number = numbers[-1]
     incremented_number = str(int(last_number) + 1)
@@ -169,36 +169,38 @@ decrypt_table = (
 
 def find_file_headers(diskdata):
     headers = []
+
     idx = 0
-    
-    while True:
-        res = diskdata.find(b"CFM\x90", idx)
-        if res == -1:
-            break
+    while idx < len(diskdata) - 3:
+        if diskdata[idx:idx+4] in (b"CFM\x90", b"FMRK"):
+            marker = diskdata[idx:idx+4]
+            filename = diskdata[idx+4:idx+36]
+            filename = clean_cstring(filename)
+            size = struct.unpack(">I", diskdata[idx+36:idx+40])[0]
+            headers.append((idx, marker, filename, size))
+            idx += 40
             
-        filename = diskdata[res+4:res+36]
-        filename = clean_cstring(filename)
-        size = struct.unpack(">I", diskdata[res+36:res+40])[0]
-        headers.append((res, filename, size))
-        idx = res + 40
-       
+        else:
+            idx += 1
+           
     return headers
 
-def decrypt_disk(diskdata, key):
+
+def decrypt_data(data, key):
     temptable = []
     for i in range(256):
         temptable.append(decrypt_table[(i - key) & 0xff])
         
     trans = bytes(temptable)
     
-    return diskdata[:0x10] + diskdata[0x10:].translate(trans)
+    return data.translate(trans)
 
 
 def find_candidate_key(diskdata):
     cands = []
     for key in range(256):
-        decrypted = decrypt_disk(diskdata, key)
-        if b"CFM\x90" in decrypted:
+        decrypted = decrypt_data(diskdata, key)
+        if b"CFM\x90" in decrypted or b"FMRK" in decrypted:
             cands.append(key)
             
     if len(cands) == 0:
@@ -208,10 +210,10 @@ def find_candidate_key(diskdata):
     if len(cands) >= 2:
         print("ERROR: Multiple candidate keys found. You have to manually pick one.")
         for key in cands:
-            decrypted = decrypt_disk(diskdata, key)
+            decrypted = decrypt_data(diskdata, key)
             headers = find_file_headers(decrypted)
             print("Files found with candidate key", key)
-            for _, filename, size in headers:
+            for _, _, filename, size in headers:
                 print("%10d %s" % (size, filename.decode("ascii", "ignore")))
             print("")
             
@@ -243,7 +245,6 @@ def main():
     parser.add_argument("-s", "--singlefile", action="store_true", help="Do not look for and try to join together sequential files")
     parser.add_argument("-k", "--key", type=int, default=None, help="Decryption key, single byte decimal")
     parser.add_argument("--keysearch", action="store_true", help="Force search for decryption key")
-    parser.add_argument("--saveplain", action="store_true", help="Save plaintext version of disk images as new files")
     parser.add_argument("-c", "--catalog", action="store_true", help="Attempt to parse main catalog for the backup archive")
     parser.add_argument("-x", "--extract", help="Exctract files to destination directory")
     
@@ -251,16 +252,10 @@ def main():
     
     if args.key is None:
         diskdata = open(args.filename, "rb").read()
-        diskdata = diskdata[:disksize]
-
-        if b"CFM\x90" in diskdata: # no encryption key needed?
-            key = None
-            
+        if not args.keysearch:
+            key = diskdata[0x0d]
         else:
-            if not args.keysearch:
-                key = diskdata[0x0d]
-            else:
-                key = find_candidate_key(diskdata)
+            key = find_candidate_key(diskdata)
 
     else:
         key = args.key
@@ -273,73 +268,70 @@ def main():
 
     else:
         currfilename = args.filename
-        while os.path.isfile(currfilename):
+        while currfilename is not None and os.path.isfile(currfilename):
             files.append(currfilename)
             currfilename = make_next(currfilename)
             
-    firstheader = None
     archivedata = bytearray()
     for currfilename in files:
         diskdata = open(currfilename, "rb").read()
-        diskdata = diskdata[:disksize]
         
         t_days, t_mins = struct.unpack(">II", diskdata[6:14])
         print("Adding disk image file", currfilename, "header", diskdata[0:4], "disk number", diskdata[4], "backup date", make_date(t_days, t_mins, 0))
         
-        if firstheader is None:
-            firstheader = diskdata[:0x18]
-            
-        decrypted = decrypt_disk(diskdata, key)
-        
-        if args.saveplain:
-            of = open("%s.key%02d.decrypted" % (currfilename, key), "wb")
-            of.write(decrypted)
-            of.close()
-        
-        archivedata += decrypted[0x10:]
-            
+        archivedata += diskdata[0x10:disksize]
+
     if args.extract:
         os.makedirs(args.extract, exist_ok=True)
         
     if args.catalog:
+        buffersize, catsize = struct.unpack(">II", archivedata[0:8])
+        
+        if key != None:
+            # file data might or might not be encrypted, quick and bad way to check
+            if b"CFM\x90" not in archivedata and b"FMRK" not in archivedata:
+                archivedata = decrypt_data(archivedata, key)
+                
+            else:
+                catdata = archivedata[:0xcc + catsize]
+                filedata = archivedata[0xcc + catsize:]
+                archivedata = decrypt_data(catdata, key) + filedata
+            
         bio = io.BytesIO(archivedata)
 
-        # Encryption starts at 0x18 for the first disk of an archive, 0x10 on the others
-        # To simplify and because we can't reliably detect the first disk, we always
-        # start decryption at 0x10. If we're looking for a catalog, we assume we got the first
-        # disk and can get the undecrypted data from the firstheader variable
-        buffersize, catsize = struct.unpack(">II", firstheader[0x10:0x18])
-        
         _, _, version, _, numvols, compress, password, comment, name, volname = struct.unpack(">IIBBHB11s100s40s40s", bio.read(0xcc))
         password = clean_cstring(password)
         comment = clean_cstring(comment)
         name = clean_cstring(name)
         volname = clean_cstring(volname)
         print("Extra header: bufsize: 0x%x  catsize: 0x%x  version: %d  numvols: %d  compress: 0x%x  password %s comment %s name %s volname %s" % (buffersize, catsize, version, numvols, compress, password, comment, name, volname))
-        
+
         count = struct.unpack(">H", bio.read(2))[0]
         catalog = read_dir(bio, count, [])
 
+        testing = True
         for size, compsize, textdate, fcount, prot, flags, fname, fullname, comment in catalog:
             textpath = b"\\".join(fullname).decode("ascii", "ignore")
             print("%10d %10d %s %5d %02x %02x %s %s" % (size, compsize, textdate, fcount, prot, flags, textpath, comment))
 
-            if not args.extract:
-                continue
-                
-            safepath = os.path.join(*[make_safe(x) for x in fullname])
-            fullpath = os.path.join(args.extract, safepath)
-
             # directory, creating if it doesn't exist
             if flags & 0x80:
-                os.makedirs(fullpath, exist_ok=True)
+                if args.extract:
+                    safepath = os.path.join(*[make_safe(x) for x in fullname])
+                    fullpath = os.path.join(args.extract, safepath)
+
+                    os.makedirs(fullpath, exist_ok=True)
+                    
+                continue
+                
+            if not testing:
                 continue
                 
             while bio.tell() % 4 != 0:
                 bio.read(1)
                
             marker = bio.read(4)
-            if marker != b"CFM\x90":
+            if marker not in (b"CFM\x90", b"FMRK"):
                 raise Exception("ERROR unexpected marker", marker)
                 
             fname2 = clean_cstring(bio.read(32))
@@ -350,14 +342,16 @@ def main():
             if size != size2:
                 raise Exception("ERROR file sizes doesn't match", size, size2)
                 
-            compdata = bio.read(compsize)
-            if len(compdata) != compsize:
-                print("ERROR didn't read all compressed data, skipping extraction of remaining files")
-                args.extract = None
+            filedata = bio.read(compsize)
+            if len(filedata) != compsize:
+                print("ERROR didn't read all compressed data, skipping extraction of remaining files", len(filedata), compsize)
+                testing = False
                 continue
                 
-            dec = Decompressor(compdata)
-            filedata = dec.decompress(size)
+            if marker == b"CFM\x90" and size != 0:
+                dec = Decompressor(filedata)
+                filedata = dec.decompress(size)
+                
             if len(filedata) > size:
                 print("WARNING oversized file", len(filedata), size)
             
@@ -366,15 +360,26 @@ def main():
             if size != size3:
                 raise Exception("ERROR file sizes doesn't match", size, size3)
                 
-            of = open(fullpath, "wb")
-            of.write(filedata[:size])
-            of.close()
+            if args.extract:
+                of = open(fullpath, "wb")
+                of.write(filedata[:size])
+                of.close()
 
     else:
-        for idx, filename, size in find_file_headers(archivedata):
+        if key != None:
+            # file data might or might not be encrypted, quick and bad way to check
+            if b"CFM\x90" not in archivedata and b"FMRK" not in archivedata:
+                archivedata = decrypt_data(archivedata, key)
+                
+        for idx, marker, filename, size in find_file_headers(archivedata):
             print("%10d %s" % (size, filename.decode("ascii", "ignore")))
-            dec = Decompressor(archivedata[idx+40:])
-            filedata = dec.decompress(size)
+            
+            if marker == b"CFM\x90" and size != 0:
+                dec = Decompressor(archivedata[idx+40:])
+                filedata = dec.decompress(size)
+            else:
+                filedata = archivedata[idx+40:idx+40+size]
+                
             if len(filedata) > size:
                 print("WARNING oversized file", len(filedata), size)
         
